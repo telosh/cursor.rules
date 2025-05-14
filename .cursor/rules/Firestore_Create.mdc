@@ -1,0 +1,197 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- 関数定義 ---
+    // ルール内で共通して利用する関数をまとめて定義します。
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // 既存ドキュメントの所有者か確認
+    function isOwner(docOwnerId) {
+      return isSignedIn() && request.auth.uid == docOwnerId;
+    }
+
+    // 新規作成ドキュメントデータに正当な所有者IDが含まれているか確認
+    function newDocHasValidOwner(ownerIdField) {
+      return isSignedIn() && request.resource.data[ownerIdField] == request.auth.uid;
+    }
+
+    // ユーザーロールを取得 (usersコレクションのroleフィールドを参照)
+    function getUserRole(uid) {
+      if (uid == null) {
+        return 'guest'; // 未認証ユーザーはゲスト
+      }
+      let userDoc = get(/databases/$(database)/documents/users/$(uid));
+      if (!userDoc.exists()) {
+        return 'guest'; // ユーザーデータが存在しない場合はゲスト
+      }
+      return userDoc.data.role != null ? userDoc.data.role : 'member'; // roleがなければ一般メンバー
+    }
+
+    // 投稿データの基本バリデーション (例)
+    function isValidPostData(data) {
+      return data.title is string && data.title.size() > 0 && data.title.size() < 100 &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
+             data.createdAt is timestamp &&
+             data.authorId is string; // authorIdも必須とする例
+    }
+
+    // --- 1. 認証 (Authentication) ---
+
+    // 例: 特定のコレクション (`some_collection`) へのアクセスはログインユーザーのみ
+    match /some_collection/{docId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // 例: ユーザー自身のデータ (`users/{userId}/private_data/{docId}`) へのアクセス
+    match /users/{userId}/private_data/{privateDocId} {
+      allow read, write: if request.auth.uid == userId;
+    }
+
+    // --- 2. データ検証 (Data Validation) & 10. リソース参照の区別 ---
+
+    // 例: 商品 (`products`) の作成と更新 (価格と在庫の検証)
+    match /products/{productId} {
+      allow create: if isSignedIn() &&
+                       request.resource.data.name is string && request.resource.data.name.size() > 0 &&
+                       request.resource.data.price is number && request.resource.data.price > 0 &&
+                       request.resource.data.stock is number && request.resource.data.stock >= 0;
+      allow update: if isSignedIn() &&
+                       isOwner(resource.data.sellerId) && //出品者のみ更新可能と仮定
+                       request.resource.data.price is number && request.resource.data.price > 0 &&
+                       request.resource.data.stock is number && request.resource.data.stock >= 0 &&
+                       request.resource.data.createdAt == resource.data.createdAt && // 作成日は変更不可
+                       request.resource.data.name == resource.data.name; // 商品名は変更不可
+      // (read, deleteルールは別途定義)
+    }
+
+    // 例: ユーザープロファイル (`users/{userId}`) の更新 (特定フィールドのみ、作成日変更不可)
+    // (注意: このパスは後述のロールベースアクセス制御の `users/{userId}` とルールが競合するため、
+    //  実際には一つの `match /users/{userId}` ブロックに統合する必要があります。)
+    //  ここではデータ検証の例として部分的に示します。
+    //  match /users/{userId} { // ← 本来は統合する
+    //    allow update: if request.auth.uid == userId &&
+    //                     request.resource.data.keys().hasOnly(['displayName', 'bio', 'photoURL']) &&
+    //                     request.resource.data.createdAt == resource.data.createdAt; // createdAtが存在する場合
+    //  }
+
+    // --- 3. アクセス制御 (Access Control) ---
+
+    // 例: 公開データ (`public_info`) は誰でも読み取り可能、書き込みは不可
+    match /public_info/{infoId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // 例: アイテム (`items`) の操作ごとの詳細制御
+    match /items/{itemId} {
+      allow get: if true; // 誰でも個別取得可能
+      allow list: if isSignedIn(); // ログインユーザーのみ一覧取得可能
+      allow create: if newDocHasValidOwner('ownerId') && /* その他のデータ検証 */;
+      allow update: if isOwner(resource.data.ownerId) && /* その他のデータ検証 */;
+      allow delete: if isOwner(resource.data.ownerId);
+    }
+
+    // --- 4. 関数の利用 (応用例) & 2. データ検証 ---
+    // 例: 投稿 (`posts`) の作成、読み取り、更新、削除 (関数とデータ検証を利用)
+    match /posts/{postId} {
+      allow read: if isSignedIn(); // ログインユーザーは投稿を読める
+      allow create: if newDocHasValidOwner('authorId') &&
+                       isValidPostData(request.resource.data);
+      allow update: if isOwner(resource.data.authorId) &&
+                       isValidPostData(request.resource.data) &&
+                       request.resource.data.authorId == resource.data.authorId && // 作成者は変更不可
+                       request.resource.data.createdAt == resource.data.createdAt; // 作成日時は変更不可
+      allow delete: if isOwner(resource.data.authorId);
+    }
+
+    // --- 5. ロールベースアクセス制御 (Role-Based Access Control) ---
+
+    // ユーザー (`users`) のドキュメント。ロール情報もここに含む想定。
+    match /users/{userId} {
+      allow read: if request.auth.uid == userId || getUserRole(request.auth.uid) == 'admin';
+      // ユーザー作成 (例: アカウント作成時など)
+      allow create: if request.auth.uid == userId &&
+                       request.resource.data.email is string && // 必須フィールド例
+                       request.resource.data.createdAt is timestamp &&
+                       (request.resource.data.role == 'member' || request.resource.data.role == null) && // 初期ロール設定
+                       request.resource.data.keys().hasOnly(['email', 'displayName', 'createdAt', 'role', 'photoURL']); // 許可フィールド
+      // ユーザー更新 (自分の情報更新 or 管理者による更新)
+      allow update: if (request.auth.uid == userId &&
+                         request.resource.data.keys().hasOnly(['displayName', 'bio', 'photoURL']) && // ユーザーが更新可能なフィールド
+                         request.resource.data.email == resource.data.email && // email変更不可
+                         request.resource.data.role == resource.data.role && // role変更不可(管理者が別途行う想定)
+                         request.resource.data.createdAt == resource.data.createdAt) || // createdAt変更不可
+                        (getUserRole(request.auth.uid) == 'admin' && // 管理者はより多くのフィールドを更新可能
+                         request.resource.data.email == resource.data.email && // email変更不可
+                         request.resource.data.createdAt == resource.data.createdAt);
+      allow delete: if getUserRole(request.auth.uid) == 'admin'; // 管理者のみユーザー削除可能 (もしくは本人のみ)
+    }
+
+    // 記事 (`articles`) のアクセス制御 (ロールベース)
+    match /articles/{articleId} {
+      allow read: if true; // 全員読み取り可能
+      allow create: if (getUserRole(request.auth.uid) == 'editor' || getUserRole(request.auth.uid) == 'admin') &&
+                       newDocHasValidOwner('authorId') && /* データ検証 */;
+      allow update: if ((getUserRole(request.auth.uid) == 'editor' && isOwner(resource.data.authorId)) ||
+                        getUserRole(request.auth.uid) == 'admin') && /* データ検証 */;
+      allow delete: if ((getUserRole(request.auth.uid) == 'editor' && isOwner(resource.data.authorId)) ||
+                        getUserRole(request.auth.uid) == 'admin');
+    }
+
+    // 管理者専用データ (`admin_only_data`) (カスタムクレーム `admin` を利用)
+    match /admin_only_data/{adminDocId} {
+      allow read, write: if request.auth.token.admin == true;
+    }
+
+    // --- 8. ルールの構造化と整理 (例) ---
+    // (このセクションの例は、他のルールとの具体的な関係性によって配置を調整)
+
+    // 例: `/collectionA` とそのサブコレクション `/subCollectionB`
+    match /collectionA/{docIdA} {
+      allow read: if true; // 仮のルール: collectionA は誰でも読める
+
+      match /subCollectionB/{docIdB} {
+        allow read: if isSignedIn(); // 仮のルール: subCollectionB はログインユーザーのみ読める
+        // (writeルール等も必要に応じて定義)
+      }
+    }
+
+    // 例: 深い階層への再帰的マッチ (`/some_root/{multiSegmentDoc=**}`)
+    // 注意: 広範囲に影響するため、条件は慎重に設定
+    match /some_root/{multiSegmentDoc=**} {
+      allow read: if getUserRole(request.auth.uid) == 'auditor'; // 例: 特定のロールのみ深い階層を読める
+      // (writeルール等も必要に応じて定義)
+    }
+
+    // --- 9. 他のドキュメントのデータに基づく制御 (`exists()` と `get()`) ---
+
+    // 例: コメント (`posts/{postId}/comments`) 作成時に親投稿が存在するか確認
+    match /posts/{postId}/comments/{commentId} {
+      allow create: if isSignedIn() &&
+                       exists(/databases/$(database)/documents/posts/$(postId)) &&
+                       newDocHasValidOwner('authorUid') && /* コメントデータの検証 */;
+      // (read, update, deleteルールも必要に応じて定義)
+    }
+
+    // 例: 注文 (`orders`) 作成時にアプリ設定 (`app_settings/global`) のメンテナンスモードを確認
+    match /orders/{orderId} {
+      allow create: if isSignedIn() &&
+                       get(/databases/$(database)/documents/app_settings/global).data.maintenanceMode == false &&
+                       newDocHasValidOwner('userId') && /* 注文データの検証 */;
+      // (read, update, deleteルールも必要に応じて定義)
+    }
+
+    // アプリ設定ドキュメント (`app_settings/global`) のルール
+    match /app_settings/global {
+        allow get: if true; // 全員が設定を読める (listは制限する等も可能)
+        allow list: if getUserRole(request.auth.uid) == 'admin'; // 管理者のみ一覧取得
+        allow write: if getUserRole(request.auth.uid) == 'admin'; // 管理者のみ設定変更可能
+    }
+
+  }
+}
